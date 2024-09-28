@@ -8,11 +8,7 @@ import pickle
 import mysql.connector
 import json
 
-global known_face_encodings, known_face_metadata
-
-# Our list of known face encodings and a matching list of metadata about each face.
-known_face_encodings = []
-known_face_metadata = []
+#global known_face_encodings, known_face_metadata
 
 
 db_config = {
@@ -25,7 +21,7 @@ db_config = {
 classRegFile = "./data/class_reg_info.csv"
 
 
-def register_new_face(face_encoding, face_image, identifiers):
+def register_new_face(face_encoding, face_image, identifiers, known_face_encodings, known_face_metadata):
 	"""
 	Add a new person to our list of known faces
 	"""
@@ -38,11 +34,17 @@ def register_new_face(face_encoding, face_image, identifiers):
 		"Last": identifiers[1],
 		"First": identifiers[2],
 		"face_image": face_image,
-		"last_seen": datetime(1,1,1,0,0)
+		"last_seen": datetime(1,1,1,0,0),
+		"seen_frames": 0,
+		"first_seen_this_interaction": datetime(1,1,1,0,0),
+		"seen_count": 0,
+		"registrations": []
 	})
+	
+	return known_face_encodings, known_face_metadata 
  
 
-def load_class_reg_data():
+def load_class_reg_data(known_face_encodings, known_face_metadata):
 	
 	with open(classRegFile, "r") as csvFile:
 		reader = csv.reader(csvFile, delimiter=',')
@@ -56,10 +58,19 @@ def load_class_reg_data():
 			if image is None:
 				break
 
-			face_locations = face_recognition.face_locations(image)
-			face_encodings = face_recognition.face_encodings(image, face_locations)
+			#face_locations = face_recognition.face_locations(image)
+			#face_encodings = face_recognition.face_encodings(image, face_locations)
 
-			small_frame = cv2.resize(image, (0,0), fx=0.5, fy=0.5)
+			#small_frame = cv2.resize(image, (0,0), fx=0.5, fy=0.5)
+			
+			# Resize frame of video to 1/4 size for faster face recognition processing
+			small_frame = cv2.resize(image, (0, 0), fx=0.25, fy=0.25)
+
+			# Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
+			rgb_small_frame = small_frame[:, :, ::-1]
+			
+			face_locations = face_recognition.face_locations(rgb_small_frame)
+			face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
 			face_encoding = face_encodings[0]
 			face_location = face_locations[0]
@@ -68,27 +79,28 @@ def load_class_reg_data():
 			face_image = small_frame[top:bottom, left:right]
 			face_image = cv2.resize(face_image, (150,150))
 
-			register_new_face(face_encoding, face_image, identifiers)
+			known_face_encodings, known_face_metadata = register_new_face(face_encoding, face_image, identifiers, known_face_encodings, known_face_metadata)
 			print(identifiers)
+	save_known_faces(known_face_encodings, known_face_metadata)
 
 
-def save_known_faces():
+def save_known_faces(known_face_encodings, known_face_metadata):
 	with open("known_faces.dat", "wb") as face_data_file:
 		face_data = [known_face_encodings, known_face_metadata]
 		pickle.dump(face_data, face_data_file)
 		print("Known faces backed up to disk.")
 
 
-def load_known_faces():
+def load_known_faces(known_face_encodings, known_face_metadata):
 	try:
 		with open("known_faces.dat", "rb") as face_data_file:
 			known_face_encodings, known_face_metadata = pickle.load(face_data_file)
 			print("Known faces loaded from disk.")
 	except FileNotFoundError as e:
 		print("No previous face data found - starting with class registration info instead.")
-		load_class_reg_data()
+		load_class_reg_data(known_face_encodings, known_face_metadata)
 		
-
+	return known_face_encodings, known_face_metadata
 
 
 def json_serial(obj):
@@ -196,12 +208,13 @@ def get_jetson_gstreamer_source():
 		)
 
 
-def lookup_known_face(face_encoding):
+def lookup_known_face(face_encoding, known_face_encodings, known_face_metadata):
 	"""
 	See if this is a face we already have in our face list
 	"""
 	metadata = None
 
+	print(len(known_face_encodings))
 	# If our known face list is empty, just return nothing since we can't possibly have seen this face.
 	if len(known_face_encodings) == 0:
 		return metadata
@@ -238,7 +251,7 @@ def lookup_known_face(face_encoding):
 	return metadata
 
 
-def main_loop():
+def main_loop(known_face_encodings, known_face_metadata):
 	# Get access to the webcam. The method is different depending on if this is running on a laptop or a Jetson Nano.
 	if running_on_jetson_nano():
 		# Accessing the camera with OpenCV on a Jetson Nano requires gstreamer with a custom gstreamer source string
@@ -271,10 +284,12 @@ def main_loop():
 		face_labels = []
 		for face_location, face_encoding in zip(face_locations, face_encodings):
 			# See if this face is in our list of known faces.
-			metadata = lookup_known_face(face_encoding)
+			print(len(known_face_encodings))
+			metadata = lookup_known_face(face_encoding, known_face_encodings, known_face_metadata)
 
 			# If we found the face, label the face with some useful information.
 			if metadata is not None:
+				print("Found face for "+metadata["First"]+" "+metadata["Last"])
 				time_at_door = datetime.now() - metadata['first_seen_this_interaction']
 				face_label = f"At door {int(time_at_door.total_seconds())}s"
 
@@ -288,7 +303,7 @@ def main_loop():
 				face_image = cv2.resize(face_image, (150, 150))
 
 				# Add the new face to our known face data
-				register_new_face(face_encoding, face_image)
+				known_face_encodings, known_face_metadata = register_new_face(face_encoding, face_image, ["No id", "John", "Doe"], known_face_encodings, known_face_metadata)
 
 			face_labels.append(face_label)
 
@@ -334,12 +349,12 @@ def main_loop():
 
 		# Hit 'q' on the keyboard to quit!
 		if cv2.waitKey(1) & 0xFF == ord('q'):
-			save_known_faces()
+			save_known_faces(known_face_encodings, known_face_metadata)
 			break
 
 		# We need to save our known faces back to disk every so often in case something crashes.
 		if len(face_locations) > 0 and number_of_faces_since_save > 100:
-			save_known_faces()
+			save_known_faces(known_face_encodings, known_face_metadata)
 			number_of_faces_since_save = 0
 		else:
 			number_of_faces_since_save += 1
@@ -350,7 +365,12 @@ def main_loop():
 
 
 if __name__ == "__main__":
-	load_known_faces()
-	main_loop()
+	# Our list of known face encodings and a matching list of metadata about each face.
+	known_face_encodings = []
+	known_face_metadata = []
+	
+	known_face_encodings, known_face_metadata = load_known_faces(known_face_encodings, known_face_metadata)
+	#print(len(known_face_encodings), len(known_face_metadata))
+	main_loop(known_face_encodings, known_face_metadata)
 	#persist_known_faces_to_db()
 	
